@@ -79,10 +79,13 @@ namespace FFImageLoading.Work
                 _maxParallelTasks = 1;
             else
                 _maxParallelTasks = (int)Math.Truncate((double)_processorCount / 2d) + 1;
+
+            logger.Debug("maxParallelTasks: " + _maxParallelTasks);
         }
 
         public void Cancel(IImageLoaderTask task)
         {
+            _logger.Debug("cancel");
             try
             {
                 if (task != null && !task.IsCancelled && !task.Completed)
@@ -107,8 +110,11 @@ namespace FFImageLoading.Work
         /// <param name="predicate">Predicate for finding relevant tasks to cancel.</param>
         public void Cancel(Func<IImageLoaderTask, bool> predicate)
         {
+            _logger.Debug(nameof(Cancel));
+            _logger.Debug($"entering {nameof(_pendingTasksLock)}");
             lock (_pendingTasksLock)
             {
+                _logger.Debug($"inside {nameof(_pendingTasksLock)}");
                 foreach (var task in _pendingTasks.Where(p => predicate(p.ImageLoadingTask)).ToList()) // FMT: here we need a copy since cancelling will trigger them to be removed, hence collection is modified during enumeration
                 {
                     task.ImageLoadingTask.Cancel();
@@ -120,12 +126,14 @@ namespace FFImageLoading.Work
 
         public void SetExitTasksEarly(bool exitTasksEarly)
         {
+            _logger.Debug(nameof(SetExitTasksEarly));
             ExitTasksEarly = exitTasksEarly;
             SetPauseWork(false);
         }
 
         public void SetPauseWork(bool pauseWork)
         {
+            _logger.Debug(nameof(SetPauseWork));
             if (_pauseWork == pauseWork)
                 return;
 
@@ -152,61 +160,70 @@ namespace FFImageLoading.Work
 
         public void RemovePendingTask(IImageLoaderTask task)
         {
+            _logger.Debug(nameof(RemovePendingTask));
             lock (_pendingTasksLock)
             {
+                _logger.Debug("Entering _pendingTasksLock");
                 _pendingTasks.RemoveAll(p => p.ImageLoadingTask == task);
             }
         }
 
-		/// <summary>
-		/// Schedules the image loading. If image is found in cache then it returns it, otherwise it loads it.
-		/// </summary>
-		/// <param name="task">Image loading task.</param>
-		public async void LoadImage(IImageLoaderTask task)
-		{
-			Interlocked.Increment(ref _loadCount);
+        /// <summary>
+        /// Schedules the image loading. If image is found in cache then it returns it, otherwise it loads it.
+        /// </summary>
+        /// <param name="task">Image loading task.</param>
+        public async void LoadImage(IImageLoaderTask task)
+        {
+            _logger.Debug(nameof(LoadImage));
+            Interlocked.Increment(ref _loadCount);
+            _logger.Debug($"_loadCount: {_loadCount}");
+            if (_verbosePerformanceLogging && (_loadCount % 10) == 0)
+            {
+                LogSchedulerStats();
+            }
 
-			if (_verbosePerformanceLogging && (_loadCount % 10) == 0)
-			{
-				LogSchedulerStats();
-			}
+            if (task == null)
+                return;
 
-			if (task == null)
-				return;
+            if (task.IsCancelled)
+            {
+                _logger.Debug("Task IsCancelled");
+                task.Parameters?.Dispose(); // this will ensure we don't keep a reference due to callbacks
+                return;
+            }
 
-			if (task.IsCancelled)
-			{
-				task.Parameters?.Dispose(); // this will ensure we don't keep a reference due to callbacks
-				return;
-			}
+            if (task.Parameters.DelayInMs != null && task.Parameters.DelayInMs > 0)
+            {
+                _logger.Debug("Delaying task for " + task.Parameters.DelayInMs);
+                await Task.Delay(task.Parameters.DelayInMs.Value).ConfigureAwait(false);
+            }
 
-			if (task.Parameters.DelayInMs != null && task.Parameters.DelayInMs > 0)
-			{
-				await Task.Delay(task.Parameters.DelayInMs.Value).ConfigureAwait(false);
-			}
+            // If we have the image in memory then it's pointless to schedule the job: just display it straight away
+            if (task.CanUseMemoryCache())
+            {
+                _logger.Debug("CanUseMemoryCache");
+                var cacheResult = await task.TryLoadingFromCacheAsync().ConfigureAwait(false);
+                if (cacheResult == CacheResult.Found) // If image is loaded from cache there is nothing to do here anymore
+                {
+                    _logger.Debug("CacheResult found");
+                    Interlocked.Increment(ref _statsTotalMemoryCacheHits);
+                    _logger.Debug($"Incremented {nameof(_statsTotalMemoryCacheHits)} to {_statsTotalMemoryCacheHits}");
+                }
 
-			// If we have the image in memory then it's pointless to schedule the job: just display it straight away
-			if (task.CanUseMemoryCache())
-			{
-				var cacheResult = await task.TryLoadingFromCacheAsync().ConfigureAwait(false);
-				if (cacheResult == CacheResult.Found) // If image is loaded from cache there is nothing to do here anymore
-				{
-					Interlocked.Increment(ref _statsTotalMemoryCacheHits);
-				}
-
-				if (cacheResult == CacheResult.Found || cacheResult == CacheResult.ErrorOccured) // if something weird happened with the cache... error callback has already been called, let's just leave
-				{
-					if (task.Parameters.OnFinish != null)
-						task.Parameters.OnFinish(task);
-					task.Dispose();
-					return;
-				}
-			}
+                if (cacheResult == CacheResult.Found || cacheResult == CacheResult.ErrorOccured) // if something weird happened with the cache... error callback has already been called, let's just leave
+                {
+                    _logger.Debug("Something weird happend...");
+                    if (task.Parameters.OnFinish != null)
+                        task.Parameters.OnFinish(task);
+                    task.Dispose();
+                    return;
+                }
+            }
             else if (task?.Parameters?.Source != ImageSource.Stream && string.IsNullOrWhiteSpace(task?.Parameters?.Path))
-			{
-				_logger.Debug("ImageService: null path ignored");
-				return;
-			}
+            {
+                _logger.Debug("ImageService: null path ignored");
+                return;
+            }
 
             _dispatch = _dispatch.ContinueWith(async t =>
             {
@@ -223,16 +240,20 @@ namespace FFImageLoading.Work
 
         private async Task LoadImageAsync(IImageLoaderTask task)
         {
+            _logger.Debug(nameof(LoadImageAsync));
             if (task.IsCancelled)
             {
+                _logger.Debug("IsCancelled");
                 task.Parameters?.Dispose(); // this will ensure we don't keep a reference due to callbacks
                 return;
             }
 
             if (!task.Parameters.Preload)
             {
+                _logger.Debug("entering _pendingTasksLock");
                 lock (_pendingTasksLock)
                 {
+                    _logger.Debug("inside _pendingTasksLock");
                     foreach (var pendingTask in _pendingTasks.ToList()) // FMT: here we need a copy since cancelling will trigger them to be removed, hence collection is modified during enumeration
                     {
                         if (pendingTask.ImageLoadingTask != null && pendingTask.ImageLoadingTask.UsesSameNativeControl(task))
@@ -244,6 +265,7 @@ namespace FFImageLoading.Work
             bool loadedFromCache = await task.PrepareAndTryLoadingFromCacheAsync().ConfigureAwait(false);
             if (loadedFromCache)
             {
+                _logger.Debug("LoadedFromCache");
                 if (task.Parameters.OnFinish != null)
                     task.Parameters.OnFinish(task);
 
@@ -260,8 +282,11 @@ namespace FFImageLoading.Work
             QueueAndGenerateImage(task);
         }
 
-        private PendingTask FindSimilarPendingTask(IImageLoaderTask task)         {             // At first check if the exact same items exists in pending tasks (exact same means same transformations, same downsample, ...)             // Since it will be exactly the same it can be retrieved from memory cache
-             string key = task.GetKey(raw: false);             var alreadyRunningTaskForSameKey = _pendingTasks.FirstOrDefault(t => t.ImageLoadingTask.GetKey(raw: false) == key);
+        private PendingTask FindSimilarPendingTask(IImageLoaderTask task)         {             _logger.Debug(nameof(FindSimilarPendingTask));
+            // At first check if the exact same items exists in pending tasks (exact same means same transformations, same downsample, ...)
+            // Since it will be exactly the same it can be retrieved from memory cache
+
+            string key = task.GetKey(raw: false);             var alreadyRunningTaskForSameKey = _pendingTasks.FirstOrDefault(t => t.ImageLoadingTask.GetKey(raw: false) == key);
 
             return alreadyRunningTaskForSameKey;         }
 
@@ -273,12 +298,15 @@ namespace FFImageLoading.Work
             var currentPendingTask = new PendingTask() { Position = position, ImageLoadingTask = task, FrameworkWrappingTask = CreateFrameworkTask(task) };
 
             PendingTask alreadyRunningTaskForSameKey = null;
+            _logger.Debug($"Entering {nameof(_pendingTasksLock)}");
             lock (_pendingTasksLock)
             {
+                _logger.Debug($"Inside {nameof(_pendingTasksLock)}");
                 alreadyRunningTaskForSameKey = FindSimilarPendingTask(task);
                 if (alreadyRunningTaskForSameKey == null)
                 {
                     Interlocked.Increment(ref _statsTotalPending);
+                    _logger.Debug($"Incremented  {nameof(_statsTotalPending)} to {_statsTotalPending}");
                     _pendingTasks.Add(currentPendingTask);
                 }
                 else
@@ -299,14 +327,20 @@ namespace FFImageLoading.Work
 
         private async void WaitForSimilarTask(PendingTask currentPendingTask, PendingTask alreadyQueuedTaskForSameKey)
         {
+            _logger.Debug(nameof(WaitForSimilarTask));
             string queuedKey = alreadyQueuedTaskForSameKey.ImageLoadingTask.GetKey();
             Interlocked.Increment(ref _statsTotalWaiting);
+            _logger.Debug($"Incremented  {nameof(_statsTotalWaiting)} to {_statsTotalWaiting}");
 
             Action forceQueue = () =>
             {
+                _logger.Debug($"Entering {nameof(_pendingTasksLock)}");
                 lock (_pendingTasksLock)
                 {
+                    _logger.Debug($"Inside {nameof(_pendingTasksLock)}");
                     Interlocked.Increment(ref _statsTotalPending);
+                    _logger.Debug($"Incremented  {nameof(_statsTotalPending)} to {_statsTotalPending}");
+
                     _pendingTasks.Add(currentPendingTask);
                 }
                 Run(currentPendingTask);
@@ -333,6 +367,7 @@ namespace FFImageLoading.Work
             }
             else
             {
+                _logger.Debug($"{nameof(CacheResult)} = {cacheResult}");
                 var task = currentPendingTask.ImageLoadingTask;
                 if (task.Parameters.OnFinish != null)
                     task.Parameters.OnFinish(task);
@@ -343,11 +378,13 @@ namespace FFImageLoading.Work
 
         private async void Run(PendingTask pendingTask)
         {
+            _logger.Debug(nameof(Run));
             await RunAsync().ConfigureAwait(false); // FMT: we limit concurrent work using MaxParallelTasks
         }
 
         private Task CreateFrameworkTask(IImageLoaderTask imageLoadingTask)
         {
+            _logger.Debug(nameof(CreateFrameworkTask));
             var parameters = imageLoadingTask.Parameters;
 
             var tcs = new TaskCompletionSource<bool>();
@@ -375,16 +412,20 @@ namespace FFImageLoading.Work
 
         private async Task RunAsync()
         {
+            _logger.Debug(nameof(RunAsync));
             Dictionary<string, PendingTask> currentLotOfPendingTasks = null;
 
+            _logger.Debug($"entering {nameof(_pendingTasksLock)}");
             lock (_pendingTasksLock)
             {
+                _logger.Debug($"inside {nameof(_pendingTasksLock)}");
                 if (_currentlyRunning.Count >= _maxParallelTasks)
                     return;
 
                 int numberOfTasks = _maxParallelTasks - _currentlyRunning.Count;
                 if (numberOfTasks > 0)
                 {
+                    _logger.Debug($"{nameof(numberOfTasks)} {numberOfTasks}");
                     currentLotOfPendingTasks = new Dictionary<string, PendingTask>();
 
 
@@ -411,6 +452,7 @@ namespace FFImageLoading.Work
                 }
             }
 
+            _logger.Debug($"{nameof(currentLotOfPendingTasks)} {currentLotOfPendingTasks}");
             if (currentLotOfPendingTasks == null || currentLotOfPendingTasks.Count == 0)
             {
                 return; // FMT: no need to do anything else
@@ -418,6 +460,7 @@ namespace FFImageLoading.Work
 
             if (currentLotOfPendingTasks.Count == 1)
             {
+
                 await QueueTaskAsync(currentLotOfPendingTasks.Values.First(), false).ConfigureAwait(false);
             }
             else
@@ -429,6 +472,7 @@ namespace FFImageLoading.Work
 
         private async Task QueueTaskAsync(PendingTask pendingTask, bool scheduleOnThreadPool)
         {
+            _logger.Debug(nameof(QueueTaskAsync));
             lock (_pendingTasksLock)
             {
                 if (_currentlyRunning.Count >= _maxParallelTasks)
@@ -520,7 +564,7 @@ namespace FFImageLoading.Work
                                          _statsTotalRunning,
                                          _statsTotalMemoryCacheHits,
                                          _statsTotalWaiting));
-            
+
             _logger.Debug(_performance.GetMemoryInfo());
         }
     }
